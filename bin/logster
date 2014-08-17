@@ -86,6 +86,8 @@ cmdline.add_option('--gmetric-options', action='store',
                     default='-d 180 -c /etc/ganglia/gmond.conf')
 cmdline.add_option('--graphite-host', action='store',
                     help='Hostname and port for Graphite collector, e.g. graphite.example.com:2003')
+cmdline.add_option('--influxdb-host', action='store',
+                    help='Hostname and port for Influx collector, e.g. influxdb.example.com:2003')
 cmdline.add_option('--statsd-host', action='store',
                     help='Hostname and port for statsd collector, e.g. statsd.example.com:8125')
 cmdline.add_option('--aws-key', action='store', default=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -102,14 +104,20 @@ cmdline.add_option('--state-dir', '-s', action='store', default=state_dir,
 cmdline.add_option('--log-dir', '-l', action='store', default=log_dir,
                     help='Where to store the logster logfile.  Default location %s' % log_dir)
 cmdline.add_option('--output', '-o', action='append',
-                   choices=('graphite', 'ganglia', 'stdout', 'cloudwatch', 'nsca', 'statsd'),
-                   help="Where to send metrics (can specify multiple times). Choices are 'graphite', 'ganglia', 'cloudwatch', 'nsca' , 'statsd', or 'stdout'.")
+                   choices=('graphite', 'ganglia', 'stdout', 'cloudwatch', 'nsca', 'statsd', 'influxdb'),
+                   help="Where to send metrics (can specify multiple times). Choices are 'graphite', 'ganglia', 'cloudwatch', 'nsca' , 'statsd', 'stdout', or 'influxdb'")
 cmdline.add_option('--stdout-separator', action='store', default="_", dest="stdout_separator",
                     help='Seperator between prefix/suffix and name for stdout. Default is \"%default\".')
 cmdline.add_option('--dry-run', '-d', action='store_true', default=False,
                     help='Parse the log file but send stats to standard output.')
 cmdline.add_option('--debug', '-D', action='store_true', default=False,
                     help='Provide more verbose logging for debugging.')
+cmdline.add_option('--influx-user', '-U', action='store', 
+                    help='Username for the server login (InfluxDB)')
+cmdline.add_option('--influx-password', '-P', action='store', 
+                    help='Password for the server login (InfluxDB)')
+cmdline.add_option('--dbname', '-N', action='store', 
+                    help='Name of database (InfluxDB)')
 options, arguments = cmdline.parse_args()
 
 if options.parser_help:
@@ -130,6 +138,9 @@ if 'cloudwatch' in options.output and not options.aws_key and not options.aws_se
 if 'nsca' in options.output and not options.nsca_host:
     cmdline.print_help()
     cmdline.error("You must supply --nsca-host when using 'nsca' as an output type.")
+if 'influxdb' in options.output and not (options.influxdb_host and options.influx_user and options.influx_password and options.dbname):
+    cmdline.print_help()
+    cmdline.error("To use influxdb, you must provide the user, password, and dbname options")
 
 class_name = arguments[0]
 if class_name.find('.') == -1:
@@ -181,6 +192,8 @@ def submit_stats(parser, duration, options):
         submit_nsca(metrics, options)
     if 'statsd' in options.output:
         submit_statsd(metrics, options)
+    if 'influxdb' in options.output:
+        submit_influxdb(metrics, options)
 
 
 def submit_stdout(metrics, options):
@@ -236,6 +249,77 @@ def submit_graphite(metrics, options):
     finally:
         if (not options.dry_run):
             s.close()
+
+def submit_influxdb(metrics, options):
+    logger.debug("Submitting {} metrics with influxdb".format(len(metrics)))
+    if (re.match("^[\w\.\-]+\:\d+$", options.influxdb_host) == None):
+        raise Exception, "Invalid host:port found for Influxdb: '%s'" % options.influxdb
+
+    from influxdb import InfluxDBClient
+
+    if (not options.dry_run):
+        host, port = options.influxdb_host.split(':')
+        #s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #s.connect((host[0], int(host[1])))
+        user = options.influx_user
+        password = options.influx_password
+        dbname = options.dbname
+    
+        logger.debug("Connecting to Influx server")
+        try:
+            client = InfluxDBClient(host=host, port=port, username=user, password=password, database=dbname)
+        except Exception, e:
+            print e
+            logger.error("exception with influxdbclient caught {}".format(e))
+            raise e
+        logger.debug("Connected")
+
+    try:
+        metric_dict = {}
+        for metric in metrics:
+    
+            if (options.metric_prefix != ""):
+                metric.name = options.metric_prefix + "." + metric.name
+            if (options.metric_suffix is not None):
+                metric.name = metric.name + "." + options.metric_suffix
+            
+            if not metric.name in metric_dict:
+                metric_dict[metric.name] = {}
+                metric_dict[metric.name]['points'] = []
+            
+            metric_dict[metric.name]['columns'] = ["time", "values"]
+            metric_dict[metric.name]['points'].append([metric.timestamp, metric.value])
+            #metric_dict[metric.name]['columns'] = ["values"]
+            #metric_dict[metric.name]['points'].append([metric.value])
+        
+        #Dict now made, need to flatten it
+        metric_list = []
+        for metric_name, metric_details in metric_dict.items():
+            metric_list.append({'points': metric_details['points'],
+                                'name': metric_name,
+                                'columns': metric_details['columns']
+                               })
+        
+        #To JSON
+        import json
+        metric_json = json.dumps(metric_list, indent=4, separators=(',', ': '))
+
+        if (not options.dry_run):
+            #Send
+            try:
+                success = client.write_points(metric_json, time_precision='m')
+            except Exception, e:
+                print e
+                logger.error("exception writing to influxdbclient caught {}".format(e))
+                raise e
+
+        if options.dry_run:
+            metric_json = json.dumps(metric_list, sort_keys=False, indent=4, separators=(',', ': '))
+            print metric_json
+            logger.debug(metric_json)
+
+    finally:
+        logger.debug("Sent")
 
 def submit_cloudwatch(metrics, options):
     for metric in metrics:
@@ -344,7 +428,6 @@ def end_locking(lockfile_fd, lockfile_name):
 
 
 def main():
-
     dirsafe_logfile = log_file.replace('/','-')
     logtail_state_file = '%s/logtail-%s%s.state' % (state_dir, class_name, dirsafe_logfile)
     logtail_lock_file  = '%s/logtail-%s%s.lock' % (state_dir, class_name, dirsafe_logfile)
@@ -352,7 +435,7 @@ def main():
 
     logger.info("Executing parser %s on logfile %s" % (class_name, log_file))
     logger.debug("Using state file %s" % logtail_state_file)
-
+    
     # Import and instantiate the class from the module passed in.
     module_name, parser_name = class_name.rsplit('.', 1)
     module = __import__(module_name, globals(), locals(), [parser_name])
@@ -363,6 +446,7 @@ def main():
     # the cron period, which is likely on first run if the logfile is huge.
     try:
         lockfile = start_locking(logtail_lock_file)
+        print "Got lock"
     except LockingError, e:
         logger.warning("Failed to get lock. Is another instance of logster running?")
         sys.exit(1)
@@ -401,23 +485,29 @@ def main():
         # I don't know when this exception will ever actually be triggered.
         print ("Failed to run %s to get log data (line %s): %s" %
                (shell_tail, lineno(), e))
+        logger.debug("Failed to run %s to get log data (line %s): %s" %
+               (shell_tail, lineno(), e))
         end_locking(lockfile, logtail_lock_file)
         sys.exit(1)
 
     # Parse each line from input, then send all stats to their collectors.
     try:
+        logger.debug("Parsing lines from input")
         for line in input:
             try:
+                #logger.debug(line)
                 parser.parse_line(line)
             except LogsterParsingException, e:
                 # This should only catch recoverable exceptions (of which there
                 # aren't any at the moment).
                 logger.debug("Parsing exception caught at %s: %s" % (lineno(), e))
 
+        logger.debug("Parsing lines from input")
         submit_stats(parser, duration, options)
 
     except Exception, e:
         print "Exception caught at %s: %s" % (lineno(), e)
+        logger.debug("Exception caught at %s: %s" % (lineno(), e))
         traceback.print_exc()
         end_locking(lockfile, logtail_lock_file)
         sys.exit(1)
