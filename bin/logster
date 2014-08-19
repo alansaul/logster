@@ -307,7 +307,7 @@ def submit_influxdb(metrics, options):
         if (not options.dry_run):
             #Send
             try:
-                success = client.write_points(metric_json, time_precision='m')
+                success = client.write_points(metric_json, time_precision='u')
             except Exception, e:
                 print e
                 logger.error("exception writing to influxdbclient caught {}".format(e))
